@@ -1,0 +1,789 @@
+// =============================================================================
+// AFRISHINE HUB - MEDIA WORKER (Cloudflare Workers + R2 + D1)
+//
+// Endpoints (unchanged for index.html):
+//   POST /upload?filename=NAME     Bearer <Firebase ID token>, body = the file
+//   POST /delete                   Bearer <Firebase ID token>, JSON { "key": "..." }
+//   GET  /media/{key}              public, supports Range requests
+//   GET  /usage[?intent=upload]    Bearer <Firebase ID token>
+//   POST /admin/recount            admin only: recount real R2 storage
+//
+// ALL upload rules are enforced HERE (not in the browser):
+//   * 10 GB total R2 capacity (TOTAL_LIMIT).
+//   * 9.5 GB of NEW uploads per billing cycle (ALLOWANCE). The cycle starts on the
+//     6th at 00:00 Africa/Kigali and ends on the 6th of the next month.
+//   * When the 9.5 GB is used: members who are not verified are blocked; verified
+//     members (publicProfiles.verified == true) and admins continue, but never
+//     beyond the 10 GB capacity.
+//   * One VIDEO per member per day (Africa/Kigali date). Admins are exempt.
+//   * Max 100 MB per file; videos up to 5 minutes (MP4/MOV length is checked here).
+//   * Quota is RESERVED in D1 with atomic conditional UPDATE statements before the
+//     file is written to R2, so many simultaneous uploads cannot exceed the quota.
+//   * Nothing already stored in R2 is ever deleted by these rules.
+//   * Verification is read from Firestore publicProfiles/{uid}.verified. Your Firestore
+//     rules MUST stop members from writing that field (see the notes).
+//
+// Required bindings:   MEDIA_BUCKET (R2)   DB (D1 database, any name)
+// Optional variables:  REQUIRE_VERIFIED_EMAIL = "1"
+//                      APPCHECK_PROJECT_NUMBER = "<Firebase project number>"
+//                      ALLOWANCE_BYTES / TOTAL_LIMIT_BYTES (override the defaults)
+// =============================================================================
+
+const PROJECT_ID = "afrishine-hub";
+
+const ALLOWED_ORIGINS = [
+  "https://afrishinegithubio.vercel.app",
+  "https://afrishine.github.io"
+];
+
+const MAX_FILE_SIZE = 100 * 1024 * 1024;       // 100 MiB per file
+const TOTAL_LIMIT = 10_000_000_000;            // 10 GB free R2 capacity
+const ALLOWANCE = 9_500_000_000;               // 9.5 GB of new uploads per cycle
+const BILLING_DAY = 6;                         // cycle starts on the 6th, 00:00
+const KIGALI_OFFSET_MS = 2 * 60 * 60 * 1000;   // Africa/Kigali = UTC+2 (no DST)
+const RESERVATION_TTL_MS = 30 * 60 * 1000;
+const MAX_VIDEO_SECONDS = 300;                 // 5 minutes (checked when the file reports its length)
+const VERIFIED_CACHE_MS = 60 * 1000;           // a newly verified member is recognised within 1 minute
+
+const MSG_VERIFY =
+  "Please complete your account verification first, then come back here to upload your video. You can also wait one week to upload without verification";
+const MSG_DAILY =
+  "Today, you have successfully uploaded your video. You can upload another one tomorrow.";
+const MSG_IN_PROGRESS =
+  "Your previous video is still uploading. Please wait a moment and try again.";
+const MSG_TOO_LONG =
+  "This video is longer than 5 minutes. Please cut it to 5 minutes or less and upload it again.";
+const MSG_TOTAL_FULL =
+  "Afrishine Hub media storage is full right now. Please try again later.";
+
+const ALLOWED_TYPES = [
+  "image/jpeg", "image/png", "image/webp", "image/gif",
+  "video/mp4", "video/webm", "video/quicktime"
+];
+const ADMIN_ONLY_TYPES = ["application/pdf"];
+
+const JWKS_URL =
+  "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com";
+const APPCHECK_JWKS_URL = "https://firebaseappcheck.googleapis.com/v1/jwks";
+
+// ---------------------------------------------------------------------------
+// Billing cycle (Africa/Kigali)
+// ---------------------------------------------------------------------------
+
+function kigaliDay(now) {
+  return new Date(now + KIGALI_OFFSET_MS).toISOString().slice(0, 10);
+}
+
+function cycleInfo(now) {
+  const k = new Date(now + KIGALI_OFFSET_MS);
+  let y = k.getUTCFullYear();
+  let m = k.getUTCMonth();
+  if (k.getUTCDate() < BILLING_DAY) {
+    m -= 1;
+    if (m < 0) { m = 11; y -= 1; }
+  }
+  let ny = y;
+  let nm = m + 1;
+  if (nm > 11) { nm = 0; ny += 1; }
+  const pad = (n) => String(n).padStart(2, "0");
+  return {
+    id: `${y}-${pad(m + 1)}`,
+    startMs: Date.UTC(y, m, BILLING_DAY, 0, 0, 0) - KIGALI_OFFSET_MS,
+    nextMs: Date.UTC(ny, nm, BILLING_DAY, 0, 0, 0) - KIGALI_OFFSET_MS,
+    startDate: `${y}-${pad(m + 1)}-${pad(BILLING_DAY)}`,
+    nextDate: `${ny}-${pad(nm + 1)}-${pad(BILLING_DAY)}`
+  };
+}
+
+function limitsFrom(env) {
+  return {
+    allowance: Number(env && env.ALLOWANCE_BYTES) || ALLOWANCE,
+    total: Number(env && env.TOTAL_LIMIT_BYTES) || TOTAL_LIMIT
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Firebase ID token + App Check verification
+// ---------------------------------------------------------------------------
+
+const jwksCache = new Map();
+
+function decodeBase64Url(value) {
+  let base64 = value.replace(/-/g, "+").replace(/_/g, "/");
+  while (base64.length % 4) base64 += "=";
+  return atob(base64);
+}
+
+async function loadJwks(url, force) {
+  const hit = jwksCache.get(url);
+  if (!force && hit && Date.now() - hit.at < 60 * 60 * 1000) return hit.keys;
+  const response = await fetch(url);
+  if (!response.ok) throw new Error("Could not load signing keys");
+  const json = await response.json();
+  jwksCache.set(url, { keys: json, at: Date.now() });
+  return json;
+}
+
+async function verifyJwt(token, jwksUrl) {
+  const parts = token.split(".");
+  if (parts.length !== 3) throw new Error("Invalid token");
+  const decodeJson = (value) => JSON.parse(decodeBase64Url(value));
+  const header = decodeJson(parts[0]);
+  const claims = decodeJson(parts[1]);
+  if (header.alg !== "RS256" || !header.kid) throw new Error("Invalid token algorithm");
+
+  let jwks = await loadJwks(jwksUrl, false);
+  let jwk = jwks.keys.find((key) => key.kid === header.kid);
+  if (!jwk) {
+    jwks = await loadJwks(jwksUrl, true);
+    jwk = jwks.keys.find((key) => key.kid === header.kid);
+  }
+  if (!jwk) throw new Error("Signing key not found");
+
+  const publicKey = await crypto.subtle.importKey(
+    "jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]
+  );
+  const signatureBytes = Uint8Array.from(decodeBase64Url(parts[2]), (c) => c.charCodeAt(0));
+  const signedData = new TextEncoder().encode(parts[0] + "." + parts[1]);
+  const valid = await crypto.subtle.verify("RSASSA-PKCS1-v1_5", publicKey, signatureBytes, signedData);
+  if (!valid) throw new Error("Unauthorized");
+  return claims;
+}
+
+async function verifyFirebaseToken(token) {
+  const claims = await verifyJwt(token, JWKS_URL);
+  const now = Math.floor(Date.now() / 1000);
+  if (
+    claims.aud !== PROJECT_ID ||
+    claims.iss !== `https://securetoken.google.com/${PROJECT_ID}` ||
+    !claims.sub || typeof claims.sub !== "string" ||
+    claims.exp <= now || claims.iat > now + 60
+  ) throw new Error("Unauthorized");
+  return claims;
+}
+
+async function verifyAppCheck(request, env) {
+  const number = env && env.APPCHECK_PROJECT_NUMBER;
+  if (!number) return; // App Check enforcement is off until the variable is set
+  const token = request.headers.get("X-Firebase-AppCheck") || "";
+  try {
+    const claims = await verifyJwt(token, APPCHECK_JWKS_URL);
+    const now = Math.floor(Date.now() / 1000);
+    const aud = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+    if (claims.iss !== `https://firebaseappcheck.googleapis.com/${number}` ||
+        !aud.includes(`projects/${number}`) || claims.exp <= now) throw new Error("bad");
+  } catch (_) {
+    throw { status: 401, code: "APPCHECK_FAILED", message: "This app could not be verified. Please reload Afrishine Hub and try again." };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Responses
+// ---------------------------------------------------------------------------
+
+function json(data, status, headers = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", ...headers }
+  });
+}
+
+function fail(code, message, status, corsHeaders, extra = {}) {
+  return json({ success: false, code, error: message, message, ...extra }, status, corsHeaders);
+}
+
+function getCorsHeaders(origin) {
+  return {
+    "Access-Control-Allow-Origin": ALLOWED_ORIGINS.includes(origin) ? origin : "null",
+    "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, Range, X-Firebase-AppCheck",
+    "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length, ETag",
+    "Access-Control-Max-Age": "86400",
+    "Vary": "Origin"
+  };
+}
+
+async function authenticate(request, env) {
+  await verifyAppCheck(request, env);
+  const authorization = request.headers.get("Authorization") || "";
+  if (!authorization.startsWith("Bearer ")) {
+    throw { status: 401, code: "LOGIN_REQUIRED", message: "Please sign in to continue." };
+  }
+  try {
+    const token = authorization.slice(7);
+    const claims = await verifyFirebaseToken(token);
+    return { sub: claims.sub, claims, token };
+  } catch (_) {
+    throw { status: 401, code: "SESSION_EXPIRED", message: "Your session has expired. Please sign in again." };
+  }
+}
+
+function safeFileName(name) {
+  return (name || "media").split(/[\\/]/).pop().replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 100) || "media";
+}
+
+function isValidKey(key) {
+  return typeof key === "string" && key.length > 0 && key.length <= 400 && !key.includes("..") && !key.startsWith("/");
+}
+
+// ---------------------------------------------------------------------------
+// Firestore roles (read with the member's own ID token through the REST API)
+// ---------------------------------------------------------------------------
+
+const roleCache = new Map();
+
+async function firestoreRead(path, idToken) {
+  return fetch(
+    `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/${path}`,
+    { headers: { Authorization: `Bearer ${idToken}` } }
+  );
+}
+
+async function isAdminMember(uid, idToken) {
+  const k = "a:" + uid;
+  const hit = roleCache.get(k);
+  if (hit && Date.now() - hit.at < 5 * 60 * 1000) return hit.value;
+  let value = false;
+  try { value = (await firestoreRead(`admins/${encodeURIComponent(uid)}`, idToken)).ok; } catch (_) { value = false; }
+  if (roleCache.size > 5000) roleCache.clear();
+  roleCache.set(k, { value, at: Date.now() });
+  return value;
+}
+
+async function isVerifiedMember(uid, idToken) {
+  const k = "v:" + uid;
+  const hit = roleCache.get(k);
+  if (hit && Date.now() - hit.at < VERIFIED_CACHE_MS) return hit.value;
+  let value = false;
+  try {
+    const response = await firestoreRead(`publicProfiles/${encodeURIComponent(uid)}`, idToken);
+    if (response.ok) {
+      const doc = await response.json();
+      value = !!(doc.fields && doc.fields.verified && doc.fields.verified.booleanValue === true);
+    }
+  } catch (_) { value = false; }
+  if (roleCache.size > 5000) roleCache.clear();
+  roleCache.set(k, { value, at: Date.now() });
+  return value;
+}
+
+// ---------------------------------------------------------------------------
+// D1 quota database
+// ---------------------------------------------------------------------------
+
+const SCHEMA = [
+  `CREATE TABLE IF NOT EXISTS totals (id INTEGER PRIMARY KEY, stored INTEGER NOT NULL DEFAULT 0, reserved INTEGER NOT NULL DEFAULT 0)`,
+  `CREATE TABLE IF NOT EXISTS cycle_usage (cycle TEXT PRIMARY KEY, normal_used INTEGER NOT NULL DEFAULT 0, normal_reserved INTEGER NOT NULL DEFAULT 0, overflow_used INTEGER NOT NULL DEFAULT 0, overflow_reserved INTEGER NOT NULL DEFAULT 0, files INTEGER NOT NULL DEFAULT 0, started_at INTEGER)`,
+  `CREATE TABLE IF NOT EXISTS uploads (id TEXT PRIMARY KEY, uid TEXT NOT NULL, cycle TEXT NOT NULL, kind TEXT NOT NULL, bytes INTEGER NOT NULL, bucket TEXT NOT NULL, state TEXT NOT NULL, r2_key TEXT, day TEXT NOT NULL, admin INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)`,
+  `CREATE INDEX IF NOT EXISTS uploads_state ON uploads (state, expires_at)`,
+  `CREATE TABLE IF NOT EXISTS daily_video (uid TEXT NOT NULL, day TEXT NOT NULL, upload_id TEXT NOT NULL, state TEXT NOT NULL, expires_at INTEGER NOT NULL, PRIMARY KEY (uid, day))`,
+  `CREATE TABLE IF NOT EXISTS blocked_users (cycle TEXT NOT NULL, uid TEXT NOT NULL, first_at INTEGER NOT NULL, PRIMARY KEY (cycle, uid))`,
+  `CREATE TABLE IF NOT EXISTS verified_continue (cycle TEXT NOT NULL, uid TEXT NOT NULL, PRIMARY KEY (cycle, uid))`,
+  `CREATE TABLE IF NOT EXISTS stored_files (key TEXT PRIMARY KEY, uid TEXT, bytes INTEGER NOT NULL, uploaded_at INTEGER NOT NULL)`
+];
+
+const readyDatabases = new WeakSet();
+const changed = (r) => (r && r.meta && r.meta.changes) || 0;
+const run = (env, sql, ...args) => env.DB.prepare(sql).bind(...args).run();
+const first = (env, sql, ...args) => env.DB.prepare(sql).bind(...args).first();
+
+async function sumBucket(bucket) {
+  let cursor;
+  let total = 0;
+  do {
+    const page = await bucket.list({ limit: 1000, ...(cursor ? { cursor } : {}) });
+    for (const object of page.objects) total += object.size || 0;
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  return total;
+}
+
+async function ensureSchema(env) {
+  if (readyDatabases.has(env.DB)) return;
+  await env.DB.batch(SCHEMA.map((sql) => env.DB.prepare(sql)));
+  const row = await first(env, `SELECT id FROM totals WHERE id = 1`);
+  if (!row) {
+    // First run: start from what is really in R2 so existing media is counted.
+    const stored = await sumBucket(env.MEDIA_BUCKET);
+    await run(env, `INSERT OR IGNORE INTO totals (id, stored, reserved) VALUES (1, ?1, 0)`, stored);
+  }
+  readyDatabases.add(env.DB);
+}
+
+async function ensureCycle(env, cycle) {
+  await run(env, `INSERT OR IGNORE INTO cycle_usage (cycle, started_at) VALUES (?1, ?2)`, cycle.id, cycle.startMs);
+}
+
+async function releaseReservation(env, r) {
+  const column = r.bucket === "normal" ? "normal_reserved" : "overflow_reserved";
+  await env.DB.batch([
+    env.DB.prepare(`UPDATE cycle_usage SET ${column} = MAX(0, ${column} - ?1) WHERE cycle = ?2`).bind(r.bytes, r.cycle),
+    env.DB.prepare(`UPDATE totals SET reserved = MAX(0, reserved - ?1) WHERE id = 1`).bind(r.bytes),
+    env.DB.prepare(`DELETE FROM daily_video WHERE uid = ?1 AND day = ?2 AND upload_id = ?3 AND state = 'pending'`).bind(r.uid, r.day, r.id)
+  ]);
+}
+
+async function reapExpired(env, now) {
+  const rows = (await env.DB.prepare(
+    `SELECT id, uid, cycle, bytes, bucket, day FROM uploads WHERE state = 'reserved' AND expires_at < ?1 LIMIT 50`
+  ).bind(now).all()).results || [];
+  for (const r of rows) {
+    const res = await run(env, `UPDATE uploads SET state = 'expired' WHERE id = ?1 AND state = 'reserved'`, r.id);
+    if (changed(res)) await releaseReservation(env, r);
+  }
+}
+
+async function reserveDailyVideo(env, uid, day, uploadId, now) {
+  const r = await run(env,
+    `INSERT INTO daily_video (uid, day, upload_id, state, expires_at) VALUES (?1, ?2, ?3, 'pending', ?4)
+     ON CONFLICT (uid, day) DO UPDATE SET upload_id = excluded.upload_id, state = 'pending', expires_at = excluded.expires_at
+     WHERE daily_video.state = 'pending' AND daily_video.expires_at < ?5`,
+    uid, day, uploadId, now + RESERVATION_TTL_MS, now);
+  if (changed(r)) return { ok: true };
+  const row = await first(env, `SELECT state FROM daily_video WHERE uid = ?1 AND day = ?2`, uid, day);
+  return { ok: false, inProgress: !!row && row.state === "pending" };
+}
+
+// Atomic quota reservation. Each UPDATE is a single conditional SQL statement,
+// so two simultaneous uploads can never both claim the last bytes.
+async function reserveBytes(env, cycleId, size, limits, mayOverflow) {
+  let bucket = "normal";
+  const pool = await run(env,
+    `UPDATE cycle_usage SET normal_reserved = normal_reserved + ?1
+     WHERE cycle = ?2 AND normal_used + normal_reserved + ?1 <= ?3`,
+    size, cycleId, limits.allowance);
+  if (!changed(pool)) {
+    if (!(await mayOverflow())) return { ok: false, reason: "POOL_FULL" };
+    bucket = "overflow";
+    await run(env, `UPDATE cycle_usage SET overflow_reserved = overflow_reserved + ?1 WHERE cycle = ?2`, size, cycleId);
+  }
+  const total = await run(env,
+    `UPDATE totals SET reserved = reserved + ?1 WHERE id = 1 AND stored + reserved + ?1 <= ?2`,
+    size, limits.total);
+  if (!changed(total)) {
+    const column = bucket === "normal" ? "normal_reserved" : "overflow_reserved";
+    await run(env, `UPDATE cycle_usage SET ${column} = MAX(0, ${column} - ?1) WHERE cycle = ?2`, size, cycleId);
+    return { ok: false, reason: "TOTAL_FULL" };
+  }
+  return { ok: true, bucket };
+}
+
+async function commitUpload(env, rec, actual, now) {
+  const stage = await run(env,
+    `UPDATE uploads SET state = 'committed', bytes = ?2, r2_key = ?3 WHERE id = ?1 AND state = 'reserved'`,
+    rec.id, actual, rec.key);
+  if (!changed(stage)) return false; // the reservation expired while uploading
+  const [reservedCol, usedCol] = rec.bucket === "normal"
+    ? ["normal_reserved", "normal_used"] : ["overflow_reserved", "overflow_used"];
+  const statements = [
+    env.DB.prepare(`UPDATE cycle_usage SET ${reservedCol} = MAX(0, ${reservedCol} - ?1), ${usedCol} = ${usedCol} + ?2, files = files + 1 WHERE cycle = ?3`).bind(rec.bytes, actual, rec.cycle),
+    env.DB.prepare(`UPDATE totals SET reserved = MAX(0, reserved - ?1), stored = stored + ?2 WHERE id = 1`).bind(rec.bytes, actual),
+    env.DB.prepare(`INSERT OR REPLACE INTO stored_files (key, uid, bytes, uploaded_at) VALUES (?1, ?2, ?3, ?4)`).bind(rec.key, rec.uid, actual, now)
+  ];
+  if (rec.kind === "video" && !rec.admin) {
+    statements.push(env.DB.prepare(`UPDATE daily_video SET state = 'committed' WHERE uid = ?1 AND day = ?2 AND upload_id = ?3`).bind(rec.uid, rec.day, rec.id));
+  }
+  if (rec.bucket === "overflow" && !rec.admin) {
+    statements.push(env.DB.prepare(`INSERT OR IGNORE INTO verified_continue (cycle, uid) VALUES (?1, ?2)`).bind(rec.cycle, rec.uid));
+  }
+  await env.DB.batch(statements);
+  return true;
+}
+
+// Undo a reservation and remove a half-finished object. Nothing already committed is touched.
+async function abortUpload(env, rec, key) {
+  const res = await run(env, `UPDATE uploads SET state = 'failed' WHERE id = ?1 AND state = 'reserved'`, rec.id).catch(() => null);
+  if (res && changed(res)) await releaseReservation(env, rec).catch(() => {});
+  await env.MEDIA_BUCKET.delete(key).catch(() => {});
+}
+
+// Reads the length of an MP4/MOV from its "mvhd" box using small range reads.
+// Returns seconds, or null when the length cannot be read (fragmented/WebM files).
+async function videoDurationSeconds(bucket, key, size, contentType) {
+  if (contentType !== "video/mp4" && contentType !== "video/quicktime") return null;
+  const readRange = async (offset, length) => {
+    const obj = await bucket.get(key, { range: { offset, length } });
+    return obj ? new DataView(await obj.arrayBuffer()) : null;
+  };
+  const tag = (v, i) => String.fromCharCode(v.getUint8(i), v.getUint8(i + 1), v.getUint8(i + 2), v.getUint8(i + 3));
+  let offset = 0;
+  for (let guard = 0; guard < 64 && offset + 8 <= size; guard++) {
+    const head = await readRange(offset, 16);
+    if (!head || head.byteLength < 8) return null;
+    let boxSize = head.getUint32(0);
+    const type = tag(head, 4);
+    let headerLen = 8;
+    if (boxSize === 1) {
+      if (head.byteLength < 16) return null;
+      boxSize = Number(head.getBigUint64(8));
+      headerLen = 16;
+    } else if (boxSize === 0) boxSize = size - offset;
+    if (boxSize < headerLen) return null;
+    if (type === "moov") {
+      const inner = await readRange(offset + headerLen, Math.min(boxSize - headerLen, 4096));
+      if (!inner) return null;
+      let p = 0;
+      while (p + 8 <= inner.byteLength) {
+        const childSize = inner.getUint32(p);
+        if (tag(inner, p + 4) === "mvhd") {
+          const version = inner.getUint8(p + 8);
+          let timescale, duration;
+          if (version === 1) {
+            if (p + 40 > inner.byteLength) return null;
+            timescale = inner.getUint32(p + 28);
+            duration = Number(inner.getBigUint64(p + 32));
+          } else {
+            if (p + 28 > inner.byteLength) return null;
+            timescale = inner.getUint32(p + 20);
+            duration = inner.getUint32(p + 24);
+          }
+          return timescale > 0 && duration > 0 ? duration / timescale : null;
+        }
+        if (childSize < 8) return null;
+        p += childSize;
+      }
+      return null;
+    }
+    offset += boxSize;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
+async function handleUpload(request, env, url, origin, corsHeaders) {
+  if (!ALLOWED_ORIGINS.includes(origin)) {
+    return fail("ORIGIN_NOT_ALLOWED", "Uploads are not allowed from this website.", 403, corsHeaders);
+  }
+  if (!env.DB) {
+    return fail("QUOTA_NOT_CONFIGURED", "Uploads are temporarily unavailable. Please try again later.", 503, corsHeaders);
+  }
+
+  const auth = await authenticate(request, env);
+  const claims = auth.claims;
+  const provider = claims.firebase && claims.firebase.sign_in_provider;
+  if (env.REQUIRE_VERIFIED_EMAIL === "1" && provider === "password" && claims.email_verified !== true) {
+    return fail("EMAIL_NOT_VERIFIED", "Please verify your email address first. Check your inbox for the verification link.", 403, corsHeaders);
+  }
+
+  const limits = limitsFrom(env);
+  const admin = await isAdminMember(auth.sub, auth.token);
+
+  const contentType = (request.headers.get("Content-Type") || "").split(";")[0].trim().toLowerCase();
+  if (!ALLOWED_TYPES.includes(contentType) && !(admin && ADMIN_ONLY_TYPES.includes(contentType))) {
+    return fail("FILE_TYPE_NOT_ALLOWED",
+      "This file format is not supported. Use JPG, PNG, WEBP, GIF, MP4, WEBM or MOV.", 415, corsHeaders);
+  }
+  if (!request.body) {
+    return fail("EMPTY_FILE", "No file received. Please choose a file and try again.", 400, corsHeaders);
+  }
+  const lengthHeader = request.headers.get("Content-Length");
+  const fileSize = Number(lengthHeader);
+  if (!lengthHeader || !Number.isFinite(fileSize)) {
+    return fail("LENGTH_REQUIRED", "The upload could not be started. Please try again.", 411, corsHeaders);
+  }
+  if (fileSize <= 0) {
+    return fail("EMPTY_FILE", "No file received. Please choose a file and try again.", 400, corsHeaders);
+  }
+  if (fileSize > MAX_FILE_SIZE) {
+    return fail("FILE_TOO_LARGE", "This file is larger than the 100 MB limit.", 413, corsHeaders);
+  }
+
+  const now = Date.now();
+  const kind = contentType.startsWith("video/") ? "video" : contentType.startsWith("image/") ? "image" : "file";
+  const day = kigaliDay(now);
+  const cycle = cycleInfo(now);
+  const uploadId = crypto.randomUUID();
+
+  await ensureSchema(env);
+  await reapExpired(env, now);
+  await ensureCycle(env, cycle);
+
+  // 1) One video per member per day.
+  let dailyHeld = false;
+  if (kind === "video" && !admin) {
+    const daily = await reserveDailyVideo(env, auth.sub, day, uploadId, now);
+    if (!daily.ok) {
+      return fail(daily.inProgress ? "UPLOAD_IN_PROGRESS" : "DAILY_VIDEO_LIMIT",
+        daily.inProgress ? MSG_IN_PROGRESS : MSG_DAILY, 429, corsHeaders);
+    }
+    dailyHeld = true;
+  }
+  const dropDaily = () => dailyHeld
+    ? run(env, `DELETE FROM daily_video WHERE uid = ?1 AND day = ?2 AND upload_id = ?3 AND state = 'pending'`, auth.sub, day, uploadId).catch(() => {})
+    : Promise.resolve();
+
+  // 2) Reserve quota: 9.5 GB pool for everyone; verified members and admins may
+  //    continue after it is used, but never past the 10 GB capacity.
+  const verified = () => admin ? Promise.resolve(true) : isVerifiedMember(auth.sub, auth.token);
+  const reservation = await reserveBytes(env, cycle.id, fileSize, limits, verified);
+  if (!reservation.ok) {
+    await dropDaily();
+    if (reservation.reason === "POOL_FULL") {
+      await run(env, `INSERT OR IGNORE INTO blocked_users (cycle, uid, first_at) VALUES (?1, ?2, ?3)`, cycle.id, auth.sub, now).catch(() => {});
+      return fail("VERIFICATION_REQUIRED", MSG_VERIFY, 507, corsHeaders, { resetsOn: cycle.nextDate });
+    }
+    return fail("STORAGE_TOTAL_FULL", MSG_TOTAL_FULL, 507, corsHeaders);
+  }
+
+  const key = `${auth.sub}/${day}/${uploadId}-${safeFileName(url.searchParams.get("filename"))}`;
+  const rec = { id: uploadId, uid: auth.sub, cycle: cycle.id, kind, bytes: fileSize, bucket: reservation.bucket, day, key, admin: admin ? 1 : 0 };
+  await run(env,
+    `INSERT INTO uploads (id, uid, cycle, kind, bytes, bucket, state, r2_key, day, admin, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'reserved', ?7, ?8, ?9, ?10, ?11)`,
+    rec.id, rec.uid, rec.cycle, rec.kind, rec.bytes, rec.bucket, rec.key, rec.day, rec.admin, now, now + RESERVATION_TTL_MS);
+
+  // 3) Write to R2 (only now that every rule has passed).
+  let stored;
+  try {
+    await env.MEDIA_BUCKET.put(key, request.body, {
+      httpMetadata: { contentType },
+      customMetadata: { owner: auth.sub, uploadedAt: new Date(now).toISOString() }
+    });
+    stored = await env.MEDIA_BUCKET.head(key);
+  } catch (error) {
+    await abortUpload(env, rec, key);
+    throw error;
+  }
+
+  // 4) Verify what really arrived (never trust the size or length the browser claims).
+  const actual = stored && stored.size ? stored.size : fileSize;
+  if (actual > MAX_FILE_SIZE || actual > fileSize) {
+    await abortUpload(env, rec, key);
+    return fail("FILE_TOO_LARGE", "This file is larger than the 100 MB limit.", 413, corsHeaders);
+  }
+  if (kind === "video") {
+    const seconds = await videoDurationSeconds(env.MEDIA_BUCKET, key, actual, contentType).catch(() => null);
+    if (seconds && seconds > MAX_VIDEO_SECONDS + 2) {
+      await abortUpload(env, rec, key);
+      return fail("VIDEO_TOO_LONG", MSG_TOO_LONG, 413, corsHeaders);
+    }
+  }
+
+  // 5) Commit the real size.
+  const ok = await commitUpload(env, rec, actual, Date.now());
+  if (!ok) {
+    await env.MEDIA_BUCKET.delete(key).catch(() => {});
+    return fail("UPLOAD_EXPIRED", "The upload took too long. Please try again.", 503, corsHeaders);
+  }
+
+  return json({
+    success: true,
+    key,
+    url: `${url.origin}/media/${key}`,
+    contentType,
+    fileSize: actual,
+    bucket: reservation.bucket
+  }, 201, corsHeaders);
+}
+
+async function handleDelete(request, env, origin, corsHeaders) {
+  if (!ALLOWED_ORIGINS.includes(origin)) {
+    return fail("ORIGIN_NOT_ALLOWED", "This action is not allowed from this website.", 403, corsHeaders);
+  }
+  const user = await authenticate(request, env);
+  const isAdmin = await isAdminMember(user.sub, user.token);
+
+  let body;
+  try { body = await request.json(); } catch (_) { return fail("BAD_REQUEST", "Invalid request.", 400, corsHeaders); }
+
+  const key = body && typeof body.key === "string" ? body.key : "";
+  if (!isValidKey(key) || (!isAdmin && !key.startsWith(`${user.sub}/`))) {
+    return fail("NOT_OWNER", "You can only delete your own media.", 403, corsHeaders);
+  }
+  const object = await env.MEDIA_BUCKET.head(key);
+  if (!object) return fail("NOT_FOUND", "File not found.", 404, corsHeaders);
+  if (!isAdmin && (!object.customMetadata || object.customMetadata.owner !== user.sub)) {
+    return fail("NOT_OWNER", "You can only delete your own media.", 403, corsHeaders);
+  }
+
+  await env.MEDIA_BUCKET.delete(key);
+  if (env.DB) {
+    try {
+      await ensureSchema(env);
+      const row = await first(env, `SELECT bytes FROM stored_files WHERE key = ?1`, key);
+      const bytes = row ? row.bytes : (object.size || 0);
+      await env.DB.batch([
+        env.DB.prepare(`UPDATE totals SET stored = MAX(0, stored - ?1) WHERE id = 1`).bind(bytes),
+        env.DB.prepare(`DELETE FROM stored_files WHERE key = ?1`).bind(key)
+      ]);
+    } catch (_) { /* admin can recount from the dashboard */ }
+  }
+  return json({ success: true, deleted: true, key }, 200, corsHeaders);
+}
+
+async function handleMedia(request, env, url, corsHeaders) {
+  let key;
+  try { key = decodeURIComponent(url.pathname.slice("/media/".length)); }
+  catch (_) { return fail("BAD_PATH", "Invalid file path.", 400, corsHeaders); }
+  if (!isValidKey(key)) return fail("BAD_PATH", "Invalid file path.", 400, corsHeaders);
+
+  const headers = new Headers(corsHeaders);
+  headers.set("Accept-Ranges", "bytes");
+  headers.set("Cache-Control", "public, max-age=604800");
+  headers.set("X-Content-Type-Options", "nosniff");
+  headers.set("Cross-Origin-Resource-Policy", "cross-origin");
+
+  if (request.method === "HEAD") {
+    const head = await env.MEDIA_BUCKET.head(key);
+    if (!head) return fail("NOT_FOUND", "File not found.", 404, corsHeaders);
+    head.writeHttpMetadata(headers);
+    headers.set("ETag", head.httpEtag);
+    headers.set("Content-Length", String(head.size));
+    return new Response(null, { status: 200, headers });
+  }
+
+  const rangeHeader = request.headers.get("Range");
+  let object;
+  try {
+    object = await env.MEDIA_BUCKET.get(key, rangeHeader ? { range: request.headers } : undefined);
+  } catch (_) {
+    return new Response(null, { status: 416, headers });
+  }
+  if (!object) return fail("NOT_FOUND", "File not found.", 404, corsHeaders);
+
+  object.writeHttpMetadata(headers);
+  headers.set("ETag", object.httpEtag);
+  headers.set("Accept-Ranges", "bytes");
+  headers.set("Cache-Control", "public, max-age=604800");
+  headers.set("X-Content-Type-Options", "nosniff");
+
+  if (!rangeHeader && request.headers.get("If-None-Match") === object.httpEtag) {
+    return new Response(null, { status: 304, headers });
+  }
+  let status = 200;
+  if (rangeHeader && object.range) {
+    const size = object.size;
+    const range = object.range;
+    let start;
+    let length;
+    if (range.suffix !== undefined) { start = Math.max(0, size - range.suffix); length = size - start; }
+    else { start = range.offset !== undefined ? range.offset : 0; length = range.length !== undefined ? range.length : size - start; }
+    headers.set("Content-Range", `bytes ${start}-${start + length - 1}/${size}`);
+    status = 206;
+  }
+  return new Response(object.body, { status, headers });
+}
+
+async function handleUsage(request, env, url, origin, corsHeaders) {
+  if (!ALLOWED_ORIGINS.includes(origin)) {
+    return fail("ORIGIN_NOT_ALLOWED", "This action is not allowed from this website.", 403, corsHeaders);
+  }
+  const auth = await authenticate(request, env);
+  const limits = limitsFrom(env);
+  const now = Date.now();
+  const cycle = cycleInfo(now);
+  const base = {
+    capacityBytes: limits.total, allowanceBytes: limits.allowance,
+    cycleId: cycle.id, cycleStartDate: cycle.startDate, nextResetDate: cycle.nextDate,
+    resetsAt: new Date(cycle.nextMs).toISOString(), timezone: "Africa/Kigali", limitBytes: limits.allowance
+  };
+  if (!env.DB) {
+    return json({ ...base, dbConnected: false, canUpload: false, full: true, usedBytes: 0 }, 200, corsHeaders);
+  }
+
+  await ensureSchema(env);
+  await reapExpired(env, now);
+  await ensureCycle(env, cycle);
+  const admin = await isAdminMember(auth.sub, auth.token);
+  const c = await first(env, `SELECT * FROM cycle_usage WHERE cycle = ?1`, cycle.id);
+  const t = await first(env, `SELECT stored, reserved FROM totals WHERE id = 1`);
+  const day = kigaliDay(now);
+  const daily = await first(env, `SELECT state, expires_at FROM daily_video WHERE uid = ?1 AND day = ?2`, auth.sub, day);
+
+  const poolUsed = c.normal_used + c.normal_reserved;
+  const poolFull = poolUsed >= limits.allowance;
+  const totalFull = t.stored + t.reserved >= limits.total;
+  const verified = poolFull && !admin ? await isVerifiedMember(auth.sub, auth.token) : false;
+  const canUpload = !totalFull && (!poolFull || verified || admin);
+  const dailyVideoUsed = !admin && !!daily && (daily.state === "committed" || daily.expires_at >= now);
+
+  // The website only calls /usage right before an upload, so a member who is stopped here
+  // is counted as "blocked by the upload limit" for this cycle (one row per member).
+  const blockedNow = poolFull && !verified && !admin;
+  if (blockedNow) {
+    await run(env, `INSERT OR IGNORE INTO blocked_users (cycle, uid, first_at) VALUES (?1, ?2, ?3)`, cycle.id, auth.sub, now).catch(() => {});
+  }
+  const blockReason = totalFull ? "STORAGE_TOTAL_FULL" : blockedNow ? "VERIFICATION_REQUIRED" : null;
+
+  const out = {
+    ...base,
+    dbConnected: true,
+    usedBytes: c.normal_used + c.overflow_used,
+    monthlyUsedBytes: c.normal_used + c.overflow_used,
+    reservedBytes: c.normal_reserved + c.overflow_reserved,
+    remainingBytes: Math.max(0, limits.allowance - poolUsed),
+    totalStoredBytes: t.stored,
+    full: poolFull,
+    poolFull,
+    verified,
+    admin,
+    canUpload,
+    blockReason,
+    message: blockReason === "VERIFICATION_REQUIRED" ? MSG_VERIFY : blockReason === "STORAGE_TOTAL_FULL" ? MSG_TOTAL_FULL : "",
+    dailyVideoUsed,
+    dailyMessage: dailyVideoUsed ? MSG_DAILY : "",
+    maxFileBytes: MAX_FILE_SIZE,
+    maxVideoSeconds: MAX_VIDEO_SECONDS,
+    kigaliDay: day
+  };
+  if (admin) {
+    const blocked = await first(env, `SELECT COUNT(*) AS n FROM blocked_users WHERE cycle = ?1`, cycle.id);
+    const vc = await first(env, `SELECT COUNT(*) AS n FROM verified_continue WHERE cycle = ?1`, cycle.id);
+    out.blockedUsers = blocked ? blocked.n : 0;
+    out.cycleStartMs = cycle.startMs;
+    out.verifiedContinuing = vc ? vc.n : 0;
+    out.filesThisCycle = c.files;
+    out.overflowBytes = c.overflow_used;
+    out.objectCount = (await first(env, `SELECT COUNT(*) AS n FROM stored_files`)).n;
+  }
+  return json(out, 200, corsHeaders);
+}
+
+async function handleRecount(request, env, origin, corsHeaders) {
+  if (!ALLOWED_ORIGINS.includes(origin)) return fail("ORIGIN_NOT_ALLOWED", "Not allowed.", 403, corsHeaders);
+  const auth = await authenticate(request, env);
+  if (!(await isAdminMember(auth.sub, auth.token))) return fail("NOT_ADMIN", "Administrators only.", 403, corsHeaders);
+  if (!env.DB) return fail("QUOTA_NOT_CONFIGURED", "The quota database is not connected.", 503, corsHeaders);
+  await ensureSchema(env);
+  const stored = await sumBucket(env.MEDIA_BUCKET);
+  await run(env, `UPDATE totals SET stored = ?1 WHERE id = 1`, stored);
+  return json({ success: true, totalStoredBytes: stored }, 200, corsHeaders);
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+export default {
+  async fetch(request, env) {
+    const origin = request.headers.get("Origin") || "";
+    const corsHeaders = getCorsHeaders(origin);
+    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders });
+
+    try {
+      const url = new URL(request.url);
+      if (url.pathname === "/upload" && request.method === "POST") return await handleUpload(request, env, url, origin, corsHeaders);
+      if (url.pathname === "/delete" && request.method === "POST") return await handleDelete(request, env, origin, corsHeaders);
+      if (url.pathname.startsWith("/media/") && (request.method === "GET" || request.method === "HEAD")) return await handleMedia(request, env, url, corsHeaders);
+      if (url.pathname === "/usage" && request.method === "GET") return await handleUsage(request, env, url, origin, corsHeaders);
+      if (url.pathname === "/admin/recount" && request.method === "POST") return await handleRecount(request, env, origin, corsHeaders);
+      if (url.pathname === "/" && request.method === "GET") {
+        return json({
+          service: "Afrishine Hub Media", status: "online",
+          capacity: "10 GB", uploadAllowance: "9.5 GB per cycle (starts on the 6th, Africa/Kigali)", maxFile: "100 MB", maxVideo: "5 minutes", dailyVideos: 1,
+          upload: "POST /upload", delete: "POST /delete with JSON { key }",
+          media: "GET /media/{file-key}", usage: "GET /usage"
+        }, 200, corsHeaders);
+      }
+      return fail("NOT_FOUND", "Not found.", 404, corsHeaders);
+    } catch (error) {
+      if (error && typeof error === "object" && error.status && error.message) {
+        return fail(error.code || "ERROR", error.message, error.status, corsHeaders);
+      }
+      console.error("Afrishine Media Worker error:", error);
+      return fail("SERVER_ERROR", "Request failed. Please try again.", 500, corsHeaders);
+    }
+  }
+};

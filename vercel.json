@@ -1,14 +1,4 @@
 
 {
-  "$schema": "https://openapi.vercel.sh/vercel.json",
-  "rewrites": [
-    {
-      "source": "/",
-      "destination": "https://afrishinegithubio.vercel.app/talent"
-    },
-    {
-      "source": "/:path*",
-      "destination": "https://afrishinegithubio.vercel.app/:path*"
-    }
-  ]
+  "$schema": "https://openapi.vercel.sh/vercel.json"
 }

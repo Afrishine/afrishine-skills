@@ -1,4 +1,13 @@
-
 {
-  "$schema": "https://openapi.vercel.sh/vercel.json"
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rewrites": [
+    {
+      "source": "/",
+      "destination": "https://afrishinegithubio.vercel.app/?mode=academy"
+    },
+    {
+      "source": "/:path*",
+      "destination": "https://afrishinegithubio.vercel.app/:path*"
+    }
+  ]
 }
